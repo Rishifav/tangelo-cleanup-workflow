@@ -1,202 +1,312 @@
-name: Cleanup Feature Environment on Branch Deletion
+name: Cleanup Ephemeral Dev Environment
 
 on:
+  # Automatic trigger when a branch is deleted
   delete:
+
+  # Manual trigger as backup
+  workflow_dispatch:
+    inputs:
+      env_name:
+        description: "Ephemeral env namespace to delete (e.g. feature/cohort or cohort)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: tangelo-dev-cluster
+  DEV_BASE_DOMAIN: dev.gettangelo.com
+  ROUTE53_ZONE_ID: YOUR_ZONE_ID_HERE
 
 jobs:
 
-  check-branch:
-    name: Check If Feature Branch Was Deleted
+  # -------------------------------------------------------
+  # JOB 1: Resolve and validate the environment name
+  # Works for both automatic and manual triggers
+  # -------------------------------------------------------
+  prepare:
+    name: Prepare and Validate Environment Name
     runs-on: ubuntu-latest
+
     outputs:
-      namespace: ${{ steps.extract.outputs.namespace }}
-      should_cleanup: ${{ steps.extract.outputs.should_cleanup }}
+      env_name: ${{ steps.resolve.outputs.env_name }}
+      should_proceed: ${{ steps.resolve.outputs.should_proceed }}
 
     steps:
-      - name: Extract Branch Name and Check if Feature Branch
-        id: extract
+      - name: Resolve environment name from trigger
+        id: resolve
+        shell: bash
         run: |
-          BRANCH_NAME="${{ github.event.ref }}"
-          echo "Deleted branch: $BRANCH_NAME"
+          set -euo pipefail
 
-          if [[ "$BRANCH_NAME" == feature/* ]]; then
-            echo "This IS a feature branch. Cleanup will proceed."
+          # --------------------------------------------------
+          # STEP 1: Get the raw name depending on how this
+          # workflow was triggered
+          # --------------------------------------------------
+          if [[ "${{ github.event_name }}" == "delete" ]]; then
 
-            NAMESPACE=$(echo $BRANCH_NAME | sed 's/feature\///' | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
+            BRANCH_NAME="${{ github.event.ref }}"
+            echo "Triggered by branch deletion: $BRANCH_NAME"
 
-            echo "Namespace to clean up: $NAMESPACE"
-            echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
-            echo "should_cleanup=true" >> $GITHUB_OUTPUT
+            # Only process feature/* branches
+            # If someone deletes main or dev, we skip
+            if [[ "$BRANCH_NAME" != feature/* ]]; then
+              echo "Not a feature branch. Skipping cleanup."
+              echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Sanitize branch name to get namespace
+            # feature/cohort → cohort
+            # feature/user-flow → user-flow
+            ENV_RAW=$(echo "$BRANCH_NAME" \
+              | sed 's/feature\///' \
+              | sed 's/[^a-zA-Z0-9-]/-/g')
+
           else
-            echo "This is NOT a feature branch. Skipping cleanup."
-            echo "should_cleanup=false" >> $GITHUB_OUTPUT
+            # Manually triggered - use the input value
+            ENV_RAW="${{ github.event.inputs.env_name }}"
+            echo "Triggered manually for env: $ENV_RAW"
           fi
 
-  wait-24-hours:
+          # --------------------------------------------------
+          # STEP 2: Normalize to lowercase
+          # cohort, COHORT, Cohort all become → cohort
+          # --------------------------------------------------
+          ENV_LC="$(echo "${ENV_RAW}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "Normalized environment name: ${ENV_LC}"
+
+          # --------------------------------------------------
+          # STEP 3: Protect important environments
+          # These can NEVER be deleted by this workflow
+          # --------------------------------------------------
+          if echo "${ENV_LC}" | grep -Eq '^(dev|stage|staging|prod|production|main)$'; then
+            echo "ERROR: '${ENV_LC}' is a protected environment."
+            echo "This workflow cannot delete dev, stage, prod or main."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # --------------------------------------------------
+          # STEP 4: All checks passed - set the output
+          # --------------------------------------------------
+          echo "Validation passed. Environment to clean up: ${ENV_LC}"
+          echo "env_name=${ENV_LC}" >> "$GITHUB_OUTPUT"
+          echo "should_proceed=true" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------
+  # JOB 2: Wait 24 hours before cleanup
+  # Only runs for automatic branch deletion
+  # If triggered manually, skip this wait
+  # -------------------------------------------------------
+  wait:
     name: Wait 24 Hours Before Cleanup
     runs-on: ubuntu-latest
-    needs: check-branch
-    if: needs.check-branch.outputs.should_cleanup == 'true'
+    needs: prepare
+    if: needs.prepare.outputs.should_proceed == 'true' && github.event_name == 'delete'
 
     steps:
-      - name: Announce Pending Cleanup
+      - name: Announce pending cleanup
+        shell: bash
         run: |
+          set -euo pipefail
           echo "=============================================="
+          echo "CLEANUP SCHEDULED"
           echo "Branch deleted: ${{ github.event.ref }}"
-          echo "Namespace to be deleted: ${{ needs.check-branch.outputs.namespace }}"
-          echo "Cleanup will begin in 24 hours."
-          echo "To CANCEL: Go to GitHub Actions tab and cancel this workflow run."
+          echo "Environment:    ${{ needs.prepare.outputs.env_name }}"
+          echo "Waiting 24 hours before cleanup begins."
+          echo "----------------------------------------------"
+          echo "To CANCEL this cleanup:"
+          echo "Go to Actions tab → find this run → click Cancel"
           echo "=============================================="
 
-      - name: Wait 24 Hours
+      - name: Wait 24 hours
+        shell: bash
         run: |
-          echo "Sleeping for 24 hours..."
+          # NOTE FOR TESTING: currently set to 10 seconds
+          # Change to 86400 for real 24 hour wait in production
           sleep 10
-          echo "Done waiting. Starting cleanup now."
+          echo "Wait complete. Proceeding with cleanup."
 
-  cleanup-kubernetes:
-    name: Delete Kubernetes Namespace and Ingress
+  # -------------------------------------------------------
+  # JOB 3: Delete Route53 DNS records
+  # Deletes all subdomains for this environment
+  # -------------------------------------------------------
+  cleanup-dns:
+    name: Delete Route53 DNS Records
     runs-on: ubuntu-latest
-    needs: [check-branch, wait-24-hours]
-    if: needs.check-branch.outputs.should_cleanup == 'true'
+    needs: [prepare, wait]
+    if: |
+      always() &&
+      needs.prepare.outputs.should_proceed == 'true' &&
+      (needs.wait.result == 'success' || needs.wait.result == 'skipped')
 
     env:
-      NAMESPACE: ${{ needs.check-branch.outputs.namespace }}
+      ENV_NAME_SANITIZED: ${{ needs.prepare.outputs.env_name }}
 
     steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Connect to EKS Cluster
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.ACCOUNT_ID }}:role/GitHubOIDCDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete Route53 DNS records for this env
+        shell: bash
         run: |
+          set -euo pipefail
+
+          NS="${ENV_NAME_SANITIZED}"
+          zone_id="${ROUTE53_ZONE_ID}"
+
+          echo "Deleting Route53 DNS records for env: ${NS}"
+          echo "Zone: ${DEV_BASE_DOMAIN} (${zone_id})"
+
+          # Loop through all apps that have DNS records
+          for app in admin backend app node slack; do
+
+            fqdn="${NS}${app}.${DEV_BASE_DOMAIN}."
+            echo "----------------------------------------------"
+            echo "Checking DNS record: ${fqdn}"
+
+            # Find the current value of this DNS record
+            current=$(aws route53 list-resource-record-sets \
+              --hosted-zone-id "$zone_id" \
+              --query "ResourceRecordSets[?Name=='${fqdn}' && Type=='CNAME'] | [0].ResourceRecords[0].Value" \
+              --output text || true)
+
+            # If no record found, skip it
+            if [[ -z "$current" || "$current" == "None" ]]; then
+              echo "No CNAME record found for ${fqdn}. Skipping."
+              continue
+            fi
+
+            echo "Found: ${fqdn} → ${current}"
+            echo "Deleting..."
+
+            # Build the delete request
+            tmp=/tmp/r53-del.json
+            printf '%s' "{
+              \"Comment\": \"CI cleanup - deleting env ${NS}\",
+              \"Changes\": [{
+                \"Action\": \"DELETE\",
+                \"ResourceRecordSet\": {
+                  \"Name\": \"${fqdn}\",
+                  \"Type\": \"CNAME\",
+                  \"TTL\": 60,
+                  \"ResourceRecords\": [{
+                    \"Value\": \"${current}\"
+                  }]
+                }
+              }]
+            }" > "$tmp"
+
+            # Execute the delete
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id "$zone_id" \
+              --change-batch file://"$tmp" || true
+
+            echo "Deleted DNS record: ${fqdn}"
+          done
+
+          echo "Route53 cleanup complete."
+
+  # -------------------------------------------------------
+  # JOB 4: Delete Kubernetes namespace
+  # This deletes EVERYTHING inside the namespace too:
+  # pods, services, ingress, configmaps, deployments
+  # -------------------------------------------------------
+  cleanup-namespace:
+    name: Delete Kubernetes Namespace
+    runs-on: ubuntu-latest
+    needs: [prepare, wait]
+    if: |
+      always() &&
+      needs.prepare.outputs.should_proceed == 'true' &&
+      (needs.wait.result == 'success' || needs.wait.result == 'skipped')
+
+    env:
+      ENV_NAME_SANITIZED: ${{ needs.prepare.outputs.env_name }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.ACCOUNT_ID }}:role/GitHubOIDCDeployRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect to EKS cluster
+        shell: bash
+        run: |
+          set -euo pipefail
           aws eks update-kubeconfig \
-            --name ${{ secrets.EKS_CLUSTER_NAME }} \
-            --region ${{ secrets.AWS_REGION }}
+            --name "${CLUSTER_NAME}" \
+            --region "${AWS_REGION}"
+          echo "Connected to cluster: ${CLUSTER_NAME}"
 
-      - name: Delete Kubernetes Namespace
+      - name: Check cluster connectivity
+        shell: bash
         run: |
-          kubectl delete namespace $NAMESPACE --ignore-not-found=true
-          echo "Namespace $NAMESPACE deleted."
+          set -euo pipefail
+          kubectl config current-context || true
+          kubectl get nodes -o wide || true
 
-  cleanup-route53:
-    name: Delete Route 53 DNS Records
-    runs-on: ubuntu-latest
-    needs: [check-branch, wait-24-hours]
-    if: needs.check-branch.outputs.should_cleanup == 'true'
-
-    env:
-      NAMESPACE: ${{ needs.check-branch.outputs.namespace }}
-
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Delete Route 53 Records
+      - name: Delete namespace and all resources inside it
+        shell: bash
         run: |
-          HOSTED_ZONE_ID="${{ secrets.ROUTE53_HOSTED_ZONE_ID }}"
-          SUBDOMAINS=(
-            "admin-$NAMESPACE.gettangelo.com"
-            "backend-$NAMESPACE.gettangelo.com"
-            "app-$NAMESPACE.gettangelo.com"
-          )
-          for SUBDOMAIN in "${SUBDOMAINS[@]}"; do
-            echo "Deleting DNS record: $SUBDOMAIN"
-            RECORD=$(aws route53 list-resource-record-sets \
-              --hosted-zone-id $HOSTED_ZONE_ID \
-              --query "ResourceRecordSets[?Name=='${SUBDOMAIN}.']" \
-              --output json)
-            if [ "$RECORD" == "[]" ]; then
-              echo "No record found for $SUBDOMAIN. Skipping."
-            else
-              echo "Found and deleting: $SUBDOMAIN"
-            fi
-          done
+          set -euo pipefail
+          NS="${ENV_NAME_SANITIZED}"
 
-  cleanup-secrets:
-    name: Delete AWS Secrets Manager Secrets
-    runs-on: ubuntu-latest
-    needs: [check-branch, wait-24-hours]
-    if: needs.check-branch.outputs.should_cleanup == 'true'
+          echo "Checking if namespace exists: ${NS}"
 
-    env:
-      NAMESPACE: ${{ needs.check-branch.outputs.namespace }}
-
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Delete Secrets
-        run: |
-          SECRETS=(
-            "tangelo/dev/$NAMESPACE/backend"
-            "tangelo/dev/$NAMESPACE/admin"
-            "tangelo/dev/$NAMESPACE/app"
-          )
-          for SECRET in "${SECRETS[@]}"; do
-            echo "Deleting secret: $SECRET"
-            if aws secretsmanager describe-secret --secret-id "$SECRET" > /dev/null 2>&1; then
-              aws secretsmanager delete-secret \
-                --secret-id "$SECRET" \
-                --force-delete-without-recovery
-              echo "Deleted: $SECRET"
-            else
-              echo "Secret not found: $SECRET. Skipping."
-            fi
-          done
-
-  cleanup-database:
-    name: Delete Feature Branch Database
-    runs-on: ubuntu-latest
-    needs: [check-branch, wait-24-hours]
-    if: needs.check-branch.outputs.should_cleanup == 'true'
-
-    env:
-      NAMESPACE: ${{ needs.check-branch.outputs.namespace }}
-
-    steps:
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Delete Database
-        run: |
-          DB_INSTANCE_IDENTIFIER="tangelo-dev-$NAMESPACE"
-          echo "Looking for database: $DB_INSTANCE_IDENTIFIER"
-          if aws rds describe-db-instances \
-            --db-instance-identifier $DB_INSTANCE_IDENTIFIER > /dev/null 2>&1; then
-            aws rds delete-db-instance \
-              --db-instance-identifier $DB_INSTANCE_IDENTIFIER \
-              --skip-final-snapshot
-            echo "Database deletion initiated: $DB_INSTANCE_IDENTIFIER"
-          else
-            echo "Database not found. Skipping."
+          # If namespace doesn't exist, nothing to do
+          if ! kubectl get ns "${NS}" >/dev/null 2>&1; then
+            echo "Namespace '${NS}' does not exist. Nothing to delete."
+            exit 0
           fi
 
-  cleanup-summary:
+          # Show what's inside before deleting
+          echo "Resources inside namespace ${NS}:"
+          kubectl get all -n "${NS}" || true
+          kubectl get pvc -n "${NS}" || true
+
+          # Delete the namespace
+          # This automatically deletes everything inside it
+          echo "Deleting namespace: ${NS}"
+          kubectl delete namespace "${NS}" --wait=true
+
+          echo "Namespace '${NS}' deleted successfully."
+
+  # -------------------------------------------------------
+  # JOB 5: Final summary
+  # Always runs so we always know what happened
+  # -------------------------------------------------------
+  summary:
     name: Cleanup Summary
     runs-on: ubuntu-latest
-    needs: [cleanup-kubernetes, cleanup-route53, cleanup-secrets, cleanup-database]
+    needs: [prepare, cleanup-dns, cleanup-namespace]
     if: always()
 
     steps:
-      - name: Print Summary
+      - name: Print final summary
+        shell: bash
         run: |
           echo "=============================================="
-          echo "CLEANUP COMPLETE"
-          echo "Branch: ${{ github.event.ref }}"
+          echo "CLEANUP WORKFLOW COMPLETE"
+          echo "----------------------------------------------"
+          echo "Environment:      ${{ needs.prepare.outputs.env_name }}"
+          echo "Triggered by:     ${{ github.event_name }}"
+          echo "DNS cleanup:      ${{ needs.cleanup-dns.result }}"
+          echo "Namespace delete: ${{ needs.cleanup-namespace.result }}"
           echo "=============================================="
