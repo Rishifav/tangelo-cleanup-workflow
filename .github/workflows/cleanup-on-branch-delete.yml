@@ -1,14 +1,16 @@
 name: Cleanup Ephemeral Dev Environment
 
 on:
-  # Automatic trigger when a branch is deleted
-  delete:
+  # This listens for signal from CI repo
+  repository_dispatch:
+    types:
+      - branch-deleted
 
-  # Manual trigger as backup
+  # This allows manual trigger as backup
   workflow_dispatch:
     inputs:
       env_name:
-        description: "Ephemeral env namespace to delete (e.g. feature/cohort or cohort)"
+        description: "Namespace to delete (e.g. cohort)"
         required: true
         type: string
 
@@ -24,10 +26,6 @@ env:
 
 jobs:
 
-  # -------------------------------------------------------
-  # JOB 1: Resolve and validate the environment name
-  # Works for both automatic and manual triggers
-  # -------------------------------------------------------
   prepare:
     name: Prepare and Validate Environment Name
     runs-on: ubuntu-latest
@@ -37,106 +35,55 @@ jobs:
       should_proceed: ${{ steps.resolve.outputs.should_proceed }}
 
     steps:
-      - name: Resolve environment name from trigger
+      - name: Resolve environment name
         id: resolve
         shell: bash
         run: |
           set -euo pipefail
 
-          # --------------------------------------------------
-          # STEP 1: Get the raw name depending on how this
-          # workflow was triggered
-          # --------------------------------------------------
-          if [[ "${{ github.event_name }}" == "delete" ]]; then
-
-            BRANCH_NAME="${{ github.event.ref }}"
-            echo "Triggered by branch deletion: $BRANCH_NAME"
-
-            # Only process feature/* branches
-            # If someone deletes main or dev, we skip
-            if [[ "$BRANCH_NAME" != feature/* ]]; then
-              echo "Not a feature branch. Skipping cleanup."
-              echo "should_proceed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            # Sanitize branch name to get namespace
-            # feature/cohort → cohort
-            # feature/user-flow → user-flow
-            ENV_RAW=$(echo "$BRANCH_NAME" \
-              | sed 's/feature\///' \
-              | sed 's/[^a-zA-Z0-9-]/-/g')
-
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            ENV_RAW="${{ github.event.client_payload.namespace }}"
+            echo "Signal received from CI repo"
+            echo "Branch that was deleted: ${{ github.event.client_payload.branch }}"
+            echo "Signal came from repo: ${{ github.event.client_payload.repo }}"
+            echo "Namespace to clean up: $ENV_RAW"
           else
-            # Manually triggered - use the input value
             ENV_RAW="${{ github.event.inputs.env_name }}"
-            echo "Triggered manually for env: $ENV_RAW"
+            echo "Manually triggered for env: $ENV_RAW"
           fi
 
-          # --------------------------------------------------
-          # STEP 2: Normalize to lowercase
-          # cohort, COHORT, Cohort all become → cohort
-          # --------------------------------------------------
           ENV_LC="$(echo "${ENV_RAW}" | tr '[:upper:]' '[:lower:]')"
 
-          echo "Normalized environment name: ${ENV_LC}"
-
-          # --------------------------------------------------
-          # STEP 3: Protect important environments
-          # These can NEVER be deleted by this workflow
-          # --------------------------------------------------
           if echo "${ENV_LC}" | grep -Eq '^(dev|stage|staging|prod|production|main)$'; then
-            echo "ERROR: '${ENV_LC}' is a protected environment."
-            echo "This workflow cannot delete dev, stage, prod or main."
+            echo "ERROR: ${ENV_LC} is a protected environment. Cannot delete."
             echo "should_proceed=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          # --------------------------------------------------
-          # STEP 4: All checks passed - set the output
-          # --------------------------------------------------
-          echo "Validation passed. Environment to clean up: ${ENV_LC}"
+          echo "Validation passed for: ${ENV_LC}"
           echo "env_name=${ENV_LC}" >> "$GITHUB_OUTPUT"
           echo "should_proceed=true" >> "$GITHUB_OUTPUT"
 
-  # -------------------------------------------------------
-  # JOB 2: Wait 24 hours before cleanup
-  # Only runs for automatic branch deletion
-  # If triggered manually, skip this wait
-  # -------------------------------------------------------
   wait:
     name: Wait 24 Hours Before Cleanup
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_proceed == 'true' && github.event_name == 'delete'
+    if: needs.prepare.outputs.should_proceed == 'true'
 
     steps:
-      - name: Announce pending cleanup
+      - name: Announce and wait
         shell: bash
         run: |
           set -euo pipefail
           echo "=============================================="
           echo "CLEANUP SCHEDULED"
-          echo "Branch deleted: ${{ github.event.ref }}"
-          echo "Environment:    ${{ needs.prepare.outputs.env_name }}"
-          echo "Waiting 24 hours before cleanup begins."
-          echo "----------------------------------------------"
-          echo "To CANCEL this cleanup:"
-          echo "Go to Actions tab → find this run → click Cancel"
+          echo "Environment: ${{ needs.prepare.outputs.env_name }}"
+          echo "Waiting before cleanup begins."
+          echo "To CANCEL: Go to Actions tab and cancel this run."
           echo "=============================================="
-
-      - name: Wait 24 hours
-        shell: bash
-        run: |
-          # NOTE FOR TESTING: currently set to 10 seconds
-          # Change to 86400 for real 24 hour wait in production
           sleep 10
-          echo "Wait complete. Proceeding with cleanup."
+          # Change sleep 10 to sleep 86400 for real 24 hour wait
 
-  # -------------------------------------------------------
-  # JOB 3: Delete Route53 DNS records
-  # Deletes all subdomains for this environment
-  # -------------------------------------------------------
   cleanup-dns:
     name: Delete Route53 DNS Records
     runs-on: ubuntu-latest
@@ -144,7 +91,7 @@ jobs:
     if: |
       always() &&
       needs.prepare.outputs.should_proceed == 'true' &&
-      (needs.wait.result == 'success' || needs.wait.result == 'skipped')
+      needs.wait.result == 'success'
 
     env:
       ENV_NAME_SANITIZED: ${{ needs.prepare.outputs.env_name }}
@@ -159,71 +106,41 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.ACCOUNT_ID }}:role/GitHubOIDCDeployRole
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Delete Route53 DNS records for this env
+      - name: Delete Route53 DNS records
         shell: bash
         run: |
           set -euo pipefail
-
           NS="${ENV_NAME_SANITIZED}"
           zone_id="${ROUTE53_ZONE_ID}"
 
-          echo "Deleting Route53 DNS records for env: ${NS}"
-          echo "Zone: ${DEV_BASE_DOMAIN} (${zone_id})"
+          echo "Deleting DNS records for env: ${NS}"
 
-          # Loop through all apps that have DNS records
           for app in admin backend app node slack; do
-
             fqdn="${NS}${app}.${DEV_BASE_DOMAIN}."
-            echo "----------------------------------------------"
-            echo "Checking DNS record: ${fqdn}"
+            echo "Checking: ${fqdn}"
 
-            # Find the current value of this DNS record
             current=$(aws route53 list-resource-record-sets \
               --hosted-zone-id "$zone_id" \
               --query "ResourceRecordSets[?Name=='${fqdn}' && Type=='CNAME'] | [0].ResourceRecords[0].Value" \
               --output text || true)
 
-            # If no record found, skip it
             if [[ -z "$current" || "$current" == "None" ]]; then
-              echo "No CNAME record found for ${fqdn}. Skipping."
+              echo "No record found for ${fqdn}. Skipping."
               continue
             fi
 
-            echo "Found: ${fqdn} → ${current}"
-            echo "Deleting..."
-
-            # Build the delete request
+            echo "Deleting: ${fqdn}"
             tmp=/tmp/r53-del.json
-            printf '%s' "{
-              \"Comment\": \"CI cleanup - deleting env ${NS}\",
-              \"Changes\": [{
-                \"Action\": \"DELETE\",
-                \"ResourceRecordSet\": {
-                  \"Name\": \"${fqdn}\",
-                  \"Type\": \"CNAME\",
-                  \"TTL\": 60,
-                  \"ResourceRecords\": [{
-                    \"Value\": \"${current}\"
-                  }]
-                }
-              }]
-            }" > "$tmp"
+            printf '%s' "{\"Comment\":\"CI cleanup\",\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":{\"Name\":\"${fqdn}\",\"Type\":\"CNAME\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"${current}\"}]}}]}" > "$tmp"
 
-            # Execute the delete
             aws route53 change-resource-record-sets \
               --hosted-zone-id "$zone_id" \
               --change-batch file://"$tmp" || true
 
-            echo "Deleted DNS record: ${fqdn}"
+            echo "Deleted: ${fqdn}"
           done
+          echo "DNS cleanup complete."
 
-          echo "Route53 cleanup complete."
-
-  # -------------------------------------------------------
-  # JOB 4: Delete Kubernetes namespace
-  # This deletes EVERYTHING inside the namespace too:
-  # pods, services, ingress, configmaps, deployments
-  # -------------------------------------------------------
   cleanup-namespace:
     name: Delete Kubernetes Namespace
     runs-on: ubuntu-latest
@@ -231,7 +148,7 @@ jobs:
     if: |
       always() &&
       needs.prepare.outputs.should_proceed == 'true' &&
-      (needs.wait.result == 'success' || needs.wait.result == 'skipped')
+      needs.wait.result == 'success'
 
     env:
       ENV_NAME_SANITIZED: ${{ needs.prepare.outputs.env_name }}
@@ -253,45 +170,25 @@ jobs:
           aws eks update-kubeconfig \
             --name "${CLUSTER_NAME}" \
             --region "${AWS_REGION}"
-          echo "Connected to cluster: ${CLUSTER_NAME}"
 
-      - name: Check cluster connectivity
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl config current-context || true
-          kubectl get nodes -o wide || true
-
-      - name: Delete namespace and all resources inside it
+      - name: Delete namespace
         shell: bash
         run: |
           set -euo pipefail
           NS="${ENV_NAME_SANITIZED}"
 
-          echo "Checking if namespace exists: ${NS}"
-
-          # If namespace doesn't exist, nothing to do
           if ! kubectl get ns "${NS}" >/dev/null 2>&1; then
-            echo "Namespace '${NS}' does not exist. Nothing to delete."
+            echo "Namespace ${NS} does not exist. Nothing to delete."
             exit 0
           fi
 
-          # Show what's inside before deleting
           echo "Resources inside namespace ${NS}:"
           kubectl get all -n "${NS}" || true
           kubectl get pvc -n "${NS}" || true
 
-          # Delete the namespace
-          # This automatically deletes everything inside it
-          echo "Deleting namespace: ${NS}"
           kubectl delete namespace "${NS}" --wait=true
+          echo "Namespace ${NS} deleted successfully."
 
-          echo "Namespace '${NS}' deleted successfully."
-
-  # -------------------------------------------------------
-  # JOB 5: Final summary
-  # Always runs so we always know what happened
-  # -------------------------------------------------------
   summary:
     name: Cleanup Summary
     runs-on: ubuntu-latest
@@ -299,12 +196,11 @@ jobs:
     if: always()
 
     steps:
-      - name: Print final summary
+      - name: Print summary
         shell: bash
         run: |
           echo "=============================================="
-          echo "CLEANUP WORKFLOW COMPLETE"
-          echo "----------------------------------------------"
+          echo "CLEANUP COMPLETE"
           echo "Environment:      ${{ needs.prepare.outputs.env_name }}"
           echo "Triggered by:     ${{ github.event_name }}"
           echo "DNS cleanup:      ${{ needs.cleanup-dns.result }}"
