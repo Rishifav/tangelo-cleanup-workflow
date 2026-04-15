@@ -1,17 +1,22 @@
 name: Cleanup Ephemeral Dev Environment
 
 on:
-  # This listens for signal from CI repo
+  # Triggered by any CI repo sending a branch-deleted signal
   repository_dispatch:
     types:
       - branch-deleted
 
-  # This allows manual trigger as backup
+  # Manual trigger as backup
   workflow_dispatch:
     inputs:
       env_name:
         description: "Namespace to delete (e.g. cohort)"
         required: true
+        type: string
+      skip_branch_check:
+        description: "Skip the cross-repo branch check? (true/false)"
+        required: false
+        default: "false"
         type: string
 
 permissions:
@@ -24,8 +29,19 @@ env:
   DEV_BASE_DOMAIN: dev.gettangelo.com
   ROUTE53_ZONE_ID: YOUR_ZONE_ID_HERE
 
+  # These are the 3 important repos that share the same namespace
+  # When a branch is deleted from any of these, we check ALL of them
+  # Only delete namespace when ALL THREE have deleted the branch
+  ADMIN_REPO: Rishifav/tangelo-ci-test      # Replace with real: your-org/admin
+  BACKEND_REPO: Rishifav/tangelo-ci-test    # Replace with real: your-org/backend
+  APP_REPO: Rishifav/tangelo-ci-test        # Replace with real: your-org/app
+
 jobs:
 
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Prepare — figure out namespace name
+  # Works for both signal trigger and manual trigger
+  # ─────────────────────────────────────────────────────────────
   prepare:
     name: Prepare and Validate Environment Name
     runs-on: ubuntu-latest
@@ -33,6 +49,8 @@ jobs:
     outputs:
       env_name: ${{ steps.resolve.outputs.env_name }}
       should_proceed: ${{ steps.resolve.outputs.should_proceed }}
+      branch_name: ${{ steps.resolve.outputs.branch_name }}
+      skip_branch_check: ${{ steps.resolve.outputs.skip_branch_check }}
 
     steps:
       - name: Resolve environment name
@@ -42,33 +60,193 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            # Signal came from a CI repo
             ENV_RAW="${{ github.event.client_payload.namespace }}"
-            echo "Signal received from CI repo"
-            echo "Branch that was deleted: ${{ github.event.client_payload.branch }}"
-            echo "Signal came from repo: ${{ github.event.client_payload.repo }}"
-            echo "Namespace to clean up: $ENV_RAW"
+            BRANCH_NAME="${{ github.event.client_payload.branch }}"
+            SOURCE_REPO="${{ github.event.client_payload.source_repo }}"
+            SKIP_CHECK="false"
+
+            echo "Signal received from CI repo: $SOURCE_REPO"
+            echo "Branch that was deleted: $BRANCH_NAME"
+            echo "Namespace to potentially clean: $ENV_RAW"
+
           else
+            # Manually triggered
             ENV_RAW="${{ github.event.inputs.env_name }}"
-            echo "Manually triggered for env: $ENV_RAW"
+            BRANCH_NAME="feature/${{ github.event.inputs.env_name }}"
+            SKIP_CHECK="${{ github.event.inputs.skip_branch_check }}"
+            echo "Manually triggered for namespace: $ENV_RAW"
           fi
 
+          # Normalize to lowercase
           ENV_LC="$(echo "${ENV_RAW}" | tr '[:upper:]' '[:lower:]')"
 
+          # Protect important environments from accidental deletion
           if echo "${ENV_LC}" | grep -Eq '^(dev|stage|staging|prod|production|main)$'; then
             echo "ERROR: ${ENV_LC} is a protected environment. Cannot delete."
             echo "should_proceed=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
-          echo "Validation passed for: ${ENV_LC}"
+          echo "Validation passed: ${ENV_LC}"
           echo "env_name=${ENV_LC}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
           echo "should_proceed=true" >> "$GITHUB_OUTPUT"
+          echo "skip_branch_check=${SKIP_CHECK}" >> "$GITHUB_OUTPUT"
 
-  wait:
-    name: Wait 24 Hours Before Cleanup
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Check Other Repos
+  # This is the NEW and most important job.
+  #
+  # Before doing anything, check if ALL THREE repos have
+  # deleted this branch. If ANY repo still has the branch,
+  # stop here and do nothing.
+  #
+  # Only when ALL THREE repos deleted the branch do we proceed.
+  # ─────────────────────────────────────────────────────────────
+  check-other-repos:
+    name: Check If All Repos Deleted This Branch
     runs-on: ubuntu-latest
     needs: prepare
     if: needs.prepare.outputs.should_proceed == 'true'
+
+    outputs:
+      all_repos_deleted: ${{ steps.check.outputs.all_repos_deleted }}
+
+    steps:
+      - name: Check branch existence in all repos
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME="${{ needs.prepare.outputs.branch_name }}"
+          NAMESPACE="${{ needs.prepare.outputs.env_name }}"
+          SKIP_CHECK="${{ needs.prepare.outputs.skip_branch_check }}"
+
+          echo "=============================================="
+          echo "CHECKING ALL REPOS FOR BRANCH: $BRANCH_NAME"
+          echo "Namespace: $NAMESPACE"
+          echo "=============================================="
+
+          # If manually triggered with skip, bypass the check
+          if [[ "$SKIP_CHECK" == "true" ]]; then
+            echo "Branch check skipped (manual override)"
+            echo "all_repos_deleted=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Function to check if a branch exists in a repo
+          # Returns "exists" or "deleted"
+          check_branch() {
+            local repo=$1
+            local branch=$2
+
+            echo "Checking $repo for branch $branch..."
+
+            # Use GitHub API to check if branch exists
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token ${{ secrets.CD_REPO_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${repo}/branches/${branch}")
+
+            if [[ "$HTTP_STATUS" == "200" ]]; then
+              echo "  → Branch EXISTS in $repo (HTTP $HTTP_STATUS)"
+              echo "  → Namespace cannot be deleted yet."
+              echo "deleted"
+            elif [[ "$HTTP_STATUS" == "404" ]]; then
+              echo "  → Branch DELETED from $repo (HTTP $HTTP_STATUS) ✅"
+              echo "exists"
+            else
+              echo "  → Could not check $repo (HTTP $HTTP_STATUS)"
+              echo "  → Treating as branch still exists (safe default)"
+              echo "deleted"
+            fi
+          }
+
+          # Encode the branch name for URL
+          # feature/cohort → feature%2Fcohort
+          BRANCH_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${BRANCH_NAME}', safe=''))")
+
+          echo ""
+          echo "--- Checking Admin Repo ---"
+          ADMIN_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.CD_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ env.ADMIN_REPO }}/branches/${BRANCH_ENCODED}")
+          echo "Admin Repo HTTP Status: $ADMIN_STATUS"
+
+          echo ""
+          echo "--- Checking Backend Repo ---"
+          BACKEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.CD_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ env.BACKEND_REPO }}/branches/${BRANCH_ENCODED}")
+          echo "Backend Repo HTTP Status: $BACKEND_STATUS"
+
+          echo ""
+          echo "--- Checking App Repo ---"
+          APP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.CD_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ env.APP_REPO }}/branches/${BRANCH_ENCODED}")
+          echo "App Repo HTTP Status: $APP_STATUS"
+
+          echo ""
+          echo "=============================================="
+          echo "RESULTS:"
+
+          # 404 means branch NOT found = branch was deleted ✅
+          # 200 means branch found = branch still exists ❌
+          ADMIN_DELETED=false
+          BACKEND_DELETED=false
+          APP_DELETED=false
+
+          [[ "$ADMIN_STATUS" == "404" ]] && ADMIN_DELETED=true
+          [[ "$BACKEND_STATUS" == "404" ]] && BACKEND_DELETED=true
+          [[ "$APP_STATUS" == "404" ]] && APP_DELETED=true
+
+          echo "Admin deleted branch:   $ADMIN_DELETED"
+          echo "Backend deleted branch: $BACKEND_DELETED"
+          echo "App deleted branch:     $APP_DELETED"
+          echo "=============================================="
+
+          # Only proceed if ALL THREE deleted the branch
+          if [[ "$ADMIN_DELETED" == "true" && \
+                "$BACKEND_DELETED" == "true" && \
+                "$APP_DELETED" == "true" ]]; then
+
+            echo ""
+            echo "✅ ALL REPOS DELETED THE BRANCH"
+            echo "Safe to proceed with namespace cleanup."
+            echo "all_repos_deleted=true" >> "$GITHUB_OUTPUT"
+
+          else
+            echo ""
+            echo "⏸️  NOT ALL REPOS DELETED THE BRANCH YET"
+            echo "Namespace cleanup will NOT proceed."
+            echo ""
+            echo "Waiting for remaining repos to delete: $BRANCH_NAME"
+            [[ "$ADMIN_DELETED" == "false" ]] && echo "  → Admin Repo still has the branch"
+            [[ "$BACKEND_DELETED" == "false" ]] && echo "  → Backend Repo still has the branch"
+            [[ "$APP_DELETED" == "false" ]] && echo "  → App Repo still has the branch"
+            echo ""
+            echo "Cleanup will trigger again when those repos delete the branch."
+            echo "all_repos_deleted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Wait 24 Hours
+  # Only runs if ALL repos deleted the branch
+  # This is the safety buffer — cancel if deleted by mistake
+  # ─────────────────────────────────────────────────────────────
+  wait:
+    name: Wait 24 Hours Before Cleanup
+    runs-on: ubuntu-latest
+    needs: [prepare, check-other-repos]
+    if: |
+      needs.prepare.outputs.should_proceed == 'true' &&
+      needs.check-other-repos.outputs.all_repos_deleted == 'true'
 
     steps:
       - name: Announce and wait
@@ -76,21 +254,30 @@ jobs:
         run: |
           set -euo pipefail
           echo "=============================================="
+          echo "ALL REPOS DELETED THE BRANCH ✅"
           echo "CLEANUP SCHEDULED"
-          echo "Environment: ${{ needs.prepare.outputs.env_name }}"
-          echo "Waiting before cleanup begins."
-          echo "To CANCEL: Go to Actions tab and cancel this run."
+          echo "Namespace: ${{ needs.prepare.outputs.env_name }}"
+          echo "Branch: ${{ needs.prepare.outputs.branch_name }}"
+          echo ""
+          echo "Waiting 24 hours before cleanup begins."
+          echo ""
+          echo "To CANCEL this cleanup:"
+          echo "Go to Actions tab → find this run → click Cancel"
           echo "=============================================="
           sleep 10
           # Change sleep 10 to sleep 86400 for real 24 hour wait
 
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4: Delete Route53 DNS Records
+  # ─────────────────────────────────────────────────────────────
   cleanup-dns:
     name: Delete Route53 DNS Records
     runs-on: ubuntu-latest
-    needs: [prepare, wait]
+    needs: [prepare, check-other-repos, wait]
     if: |
       always() &&
       needs.prepare.outputs.should_proceed == 'true' &&
+      needs.check-other-repos.outputs.all_repos_deleted == 'true' &&
       needs.wait.result == 'success'
 
     env:
@@ -113,7 +300,7 @@ jobs:
           NS="${ENV_NAME_SANITIZED}"
           zone_id="${ROUTE53_ZONE_ID}"
 
-          echo "Deleting DNS records for env: ${NS}"
+          echo "Deleting DNS records for namespace: ${NS}"
 
           for app in admin backend app node slack; do
             fqdn="${NS}${app}.${DEV_BASE_DOMAIN}."
@@ -137,17 +324,21 @@ jobs:
               --hosted-zone-id "$zone_id" \
               --change-batch file://"$tmp" || true
 
-            echo "Deleted: ${fqdn}"
+            echo "Deleted: ${fqdn} ✅"
           done
           echo "DNS cleanup complete."
 
+  # ─────────────────────────────────────────────────────────────
+  # JOB 5: Delete Kubernetes Namespace
+  # ─────────────────────────────────────────────────────────────
   cleanup-namespace:
     name: Delete Kubernetes Namespace
     runs-on: ubuntu-latest
-    needs: [prepare, wait]
+    needs: [prepare, check-other-repos, wait]
     if: |
       always() &&
       needs.prepare.outputs.should_proceed == 'true' &&
+      needs.check-other-repos.outputs.all_repos_deleted == 'true' &&
       needs.wait.result == 'success'
 
     env:
@@ -171,28 +362,35 @@ jobs:
             --name "${CLUSTER_NAME}" \
             --region "${AWS_REGION}"
 
-      - name: Delete namespace
+      - name: Delete namespace and all resources
         shell: bash
         run: |
           set -euo pipefail
           NS="${ENV_NAME_SANITIZED}"
+
+          echo "Checking if namespace exists: ${NS}"
 
           if ! kubectl get ns "${NS}" >/dev/null 2>&1; then
             echo "Namespace ${NS} does not exist. Nothing to delete."
             exit 0
           fi
 
-          echo "Resources inside namespace ${NS}:"
+          echo "Resources in namespace ${NS}:"
           kubectl get all -n "${NS}" || true
           kubectl get pvc -n "${NS}" || true
 
+          echo "Deleting namespace: ${NS}"
           kubectl delete namespace "${NS}" --wait=true
-          echo "Namespace ${NS} deleted successfully."
 
+          echo "Namespace ${NS} deleted successfully ✅"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 6: Cleanup Summary — always runs
+  # ─────────────────────────────────────────────────────────────
   summary:
     name: Cleanup Summary
     runs-on: ubuntu-latest
-    needs: [prepare, cleanup-dns, cleanup-namespace]
+    needs: [prepare, check-other-repos, cleanup-dns, cleanup-namespace]
     if: always()
 
     steps:
@@ -200,9 +398,20 @@ jobs:
         shell: bash
         run: |
           echo "=============================================="
-          echo "CLEANUP COMPLETE"
-          echo "Environment:      ${{ needs.prepare.outputs.env_name }}"
+          echo "WORKFLOW COMPLETE"
+          echo "----------------------------------------------"
+          echo "Namespace:        ${{ needs.prepare.outputs.env_name }}"
+          echo "Branch:           ${{ needs.prepare.outputs.branch_name }}"
           echo "Triggered by:     ${{ github.event_name }}"
+          echo "All repos deleted: ${{ needs.check-other-repos.outputs.all_repos_deleted }}"
+          echo "----------------------------------------------"
           echo "DNS cleanup:      ${{ needs.cleanup-dns.result }}"
           echo "Namespace delete: ${{ needs.cleanup-namespace.result }}"
           echo "=============================================="
+
+          if [[ "${{ needs.check-other-repos.outputs.all_repos_deleted }}" == "false" ]]; then
+            echo ""
+            echo "ℹ️  CLEANUP WAS SKIPPED"
+            echo "Reason: Other repos still have this branch."
+            echo "Cleanup will run automatically when all repos delete the branch."
+          fi
